@@ -1536,12 +1536,12 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server) (*Str
 }
 
 // Update will allow certain configuration properties of an existing stream to be updated.
-func (mset *stream) update(config *StreamConfig) error {
-	return mset.updateWithAdvisory(config, true)
+func (mset *stream) update(config *StreamConfig, forceLimits bool) error {
+	return mset.updateWithAdvisory(config, true, forceLimits)
 }
 
 // Update will allow certain configuration properties of an existing stream to be updated.
-func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) error {
+func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory, forceLimits bool) error {
 	_, jsa, err := mset.acc.checkForJetStream()
 	if err != nil {
 		return err
@@ -1557,10 +1557,12 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) 
 		return NewJSStreamInvalidConfigError(err, Unless(err))
 	}
 
-	// In the event that some of the stream-level limits have changed, yell appropriately.
-	var errorConsumers []string
-	if ocfg.LimitInactiveThreshold != cfg.LimitInactiveThreshold ||
-		ocfg.LimitMaxAckPending != cfg.LimitMaxAckPending {
+	// In the event that some of the stream-level limits have changed, yell appropriately
+	// if any of the consumers exceed that limit.
+	updateLimits := ocfg.LimitInactiveThreshold != cfg.LimitInactiveThreshold ||
+		ocfg.LimitMaxAckPending != cfg.LimitMaxAckPending
+	if !forceLimits && updateLimits {
+		var errorConsumers []string
 		for _, c := range mset.consumers {
 			c.mu.RLock()
 			ccfg := c.cfg
@@ -1570,11 +1572,11 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) 
 				errorConsumers = append(errorConsumers, c.name)
 			}
 		}
-	}
-	if len(errorConsumers) > 0 {
-		// TODO(nat): Return a parsable error so that we can surface something
-		// sensible through the JS API.
-		return fmt.Errorf("change to limits violates consumers: %s", strings.Join(errorConsumers, ", "))
+		if len(errorConsumers) > 0 {
+			// TODO(nat): Return a parsable error so that we can surface something
+			// sensible through the JS API.
+			return fmt.Errorf("change to limits violates consumers: %s", strings.Join(errorConsumers, ", "))
+		}
 	}
 
 	jsa.mu.RLock()
@@ -1724,6 +1726,24 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) 
 		}
 		// else in case the new tier does not exist (say on move), keep the old tier around
 		// a subsequent update to an existing tier will then move from existing past tier to existing new tier
+	}
+
+	// If we're forcing limit changes, apply them.
+	if forceLimits && updateLimits {
+		for _, c := range mset.consumers {
+			c.mu.RLock()
+			ccfg := c.cfg
+			c.mu.RUnlock()
+			if cfg.LimitMaxAckPending > 0 && ccfg.MaxAckPending > cfg.LimitMaxAckPending {
+				ccfg.MaxAckPending = cfg.LimitMaxAckPending
+			}
+			if cfg.LimitInactiveThreshold > 0 && ccfg.InactiveThreshold > cfg.LimitInactiveThreshold {
+				ccfg.InactiveThreshold = cfg.LimitInactiveThreshold
+			}
+			if err := c.updateConfig(&ccfg); err != nil {
+				return fmt.Errorf("failed to update consumer %q limits: %s", c.name, err)
+			}
+		}
 	}
 
 	// Now update config and store's version of our config.
@@ -5272,7 +5292,7 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 
 	// Make sure we do an update if the configs have changed.
 	if !reflect.DeepEqual(fcfg.StreamConfig, cfg) {
-		if err := mset.update(&cfg); err != nil {
+		if err := mset.update(&cfg, false); err != nil {
 			return nil, err
 		}
 	}
