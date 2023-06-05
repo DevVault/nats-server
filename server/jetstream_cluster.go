@@ -3328,7 +3328,6 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			js.mu.Unlock()
 		}
 		// Call update.
-		// TODO(nat): replace false here with a forced flag
 		if err = mset.updateWithAdvisory(cfg, !recovering, false); err != nil {
 			s.Warnf("JetStream cluster error updating stream %q for account %q: %v", cfg.Name, acc.Name, err)
 		}
